@@ -412,7 +412,7 @@ while True:
                     mos = margin_of_safety(price, market_price)
                     upside = (price - market_price) / market_price * 100
                     color = "green" if upside > 0 else "red"
-                    window[mos_key].update(f"{mos:+.1f}%",    text_color=color)
+                    window[mos_key].update(f"{mos:+.1f}%" if mos is not None else "—", text_color=color)
                     window[upside_key].update(f"{upside:+.1f}%", text_color=color)
                 else:
                     window[mos_key].update("—")
