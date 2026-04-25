@@ -1,32 +1,21 @@
+import json
+import os
+import glob
+import subprocess
+import sys
 import FreeSimpleGUI as sg
-from google.oauth2.service_account import Credentials
-import gspread
-
-# ── Google Sheets setup ────────────────────────────────────────────────────────
-
-CREDENTIALS_PATH = 'credentials.json' #Google servise account credentials
-SPREADSHEET_NAME = 'DCF DB' #Sheet file name (change to whatever fork for you)
-SHEET_NAME = 'DB' #Sheet name
-
-scope = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
-]
-
-creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scope)
-gc = gspread.authorize(creds)
 
 
-def get_worksheet():
-    try:
-        return gc.open(SPREADSHEET_NAME).worksheet(SHEET_NAME)
-    except gspread.SpreadsheetNotFound:
-        sg.popup_error(f"Spreadsheet '{SPREADSHEET_NAME}' not found!")
-    except gspread.WorksheetNotFound:
-        sg.popup_error(f"Sheet '{SHEET_NAME}' not found in '{SPREADSHEET_NAME}'!")
-    except Exception as e:
-        sg.popup_error(f"Error accessing spreadsheet: {e}")
-    return None
+# ── Local database setup ───────────────────────────────────────────────────────
+
+DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcf_db")
+os.makedirs(DB_DIR, exist_ok=True)
+
+
+def _analysis_path(name: str) -> str:
+    """Return the file path for a given analysis name."""
+    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name)
+    return os.path.join(DB_DIR, f"{safe}.json")
 
 
 # ── Core DCF logic ─────────────────────────────────────────────────────────────
@@ -44,13 +33,13 @@ def dcf_calculate(last_fcf, debt, cash, shares_outstanding, years,
     terminal_value = projected_fcfs[-1] * (1 + terminal_growth_rate) / (wacc - terminal_growth_rate)
     discounted_tv = terminal_value / (1 + wacc) ** years
     enterprise_value = sum(discounted_fcfs) + discounted_tv
-    intrinsic_value = enterprise_value - debt + cash
-    intrinsic_price = intrinsic_value / shares_outstanding
+    equity_value = enterprise_value - debt + cash
+    intrinsic_price = equity_value / shares_outstanding
 
     return {
         "price": intrinsic_price,
         "enterprise_value": enterprise_value,
-        "intrinsic_value": intrinsic_value,
+        "equity_value": equity_value,
         "discounted_tv": discounted_tv,
         "sum_dcf": sum(discounted_fcfs),
     }
@@ -61,7 +50,6 @@ def margin_of_safety(intrinsic_price, market_price):
     if intrinsic_price <= 0:
         return None
     return (intrinsic_price - market_price) / intrinsic_price * 100
-
 
 
 def build_sensitivity_table(last_fcf, debt, cash, shares, years,
@@ -92,92 +80,81 @@ def build_sensitivity_table(last_fcf, debt, cash, shares, years,
 
 # ── Database helpers ───────────────────────────────────────────────────────────
 
-HEADER = [
-    "analysis_name", "last_fcf", "debt", "cash", "shares", "years",
-    "market_price",
-    "pessimistic_growth", "pessimistic_wacc", "pessimistic_terminal",
-    "middle_growth",      "middle_wacc",      "middle_terminal",
-    "optimistic_growth",  "optimistic_wacc",  "optimistic_terminal",
-    "notes",
-]
+_META = {
+    "_meta": {
+        "analysis_name":        "User-defined label for this analysis",
+        "last_fcf":             "Last reported Free Cash Flow in millions",
+        "debt":                 "Total debt in millions (used in equity bridge: EV - debt + cash)",
+        "cash":                 "Cash and equivalents in millions",
+        "shares":               "Diluted shares outstanding in millions",
+        "years":                "DCF projection horizon in years (typically 5–10)",
+        "market_price":         "Current market price per share in dollars — optional, enables MoS and upside display",
+        "*_growth":             "FCF growth rate as a percentage (e.g. 6 means 6%)",
+        "*_wacc":               "Weighted average cost of capital as a percentage — must exceed terminal growth rate",
+        "*_terminal":           "Terminal growth rate as a percentage — Gordon Growth Model perpetuity rate",
+        "notes":                "Free-text notes",
+    }
+}
 
 
 def load_database():
-    worksheet = get_worksheet()
-    if not worksheet:
-        return [], []
-    try:
-        data = worksheet.get_all_values()
-        if not data or len(data) < 2:
-            return [], []
-        header = data[0]
-        database = [dict(zip(header, row)) for row in data[1:]]
-        names = [a.get("analysis_name", "N/A") for a in database]
-        return database, names
-    except Exception as e:
-        sg.popup_error(f"Error loading database: {e}")
-        return [], []
+    """Load all analyses from the dcf_db directory. Keys starting with '_' are ignored."""
+    files = sorted(glob.glob(os.path.join(DB_DIR, "*.json")))
+    database = []
+    for filepath in files:
+        try:
+            with open(filepath, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            record = {k: v for k, v in raw.items() if not k.startswith("_")}
+            database.append(record)
+        except Exception:
+            pass  # skip corrupt or unreadable files silently
+    names = [a.get("analysis_name", "N/A") for a in database]
+    return database, names
 
 
 def save_analysis(analysis_name, values):
-    worksheet = get_worksheet()
-    if not worksheet:
-        return
+    """Save a single analysis as an individual JSON file in dcf_db/."""
+    row = {
+        "analysis_name":        analysis_name,
+        "last_fcf":             values.get("-LAST_FCF-", ""),
+        "debt":                 values.get("-DEBT-", ""),
+        "cash":                 values.get("-CASH-", ""),
+        "shares":               values.get("-SHARES-", ""),
+        "years":                values.get("-YEARS-", ""),
+        "market_price":         values.get("-MARKET_PRICE-", ""),
+        "pessimistic_growth":   values.get("-PESSIMISTIC_GROWTH-", ""),
+        "pessimistic_wacc":     values.get("-PESSIMISTIC_WACC-", ""),
+        "pessimistic_terminal": values.get("-PESSIMISTIC_TERMINAL-", ""),
+        "middle_growth":        values.get("-MIDDLE_GROWTH-", ""),
+        "middle_wacc":          values.get("-MIDDLE_WACC-", ""),
+        "middle_terminal":      values.get("-MIDDLE_TERMINAL-", ""),
+        "optimistic_growth":    values.get("-OPTIMISTIC_GROWTH-", ""),
+        "optimistic_wacc":      values.get("-OPTIMISTIC_WACC-", ""),
+        "optimistic_terminal":  values.get("-OPTIMISTIC_TERMINAL-", ""),
+        "notes":                values.get("-NOTES-", "").strip(),
+        **_META,
+    }
     try:
-        # Get all existing data to find the true next empty row.
-        # append_row() can overwrite the last row when the sheet has
-        # trailing empty rows, so we write explicitly by row index instead.
-        all_rows = worksheet.get_all_values()
-
-        if not all_rows:
-            worksheet.update(values=[HEADER], range_name="A1")
-            next_row = 2
-        else:
-            if all_rows[0] != HEADER:
-                worksheet.update(values=[HEADER], range_name="A1")
-            next_row = len(all_rows) + 1
-
-        row = [
-            analysis_name,
-            values.get("-LAST_FCF-", ""),
-            values.get("-DEBT-", ""),
-            values.get("-CASH-", ""),
-            values.get("-SHARES-", ""),
-            values.get("-YEARS-", ""),
-            values.get("-MARKET_PRICE-", ""),
-            values.get("-PESSIMISTIC_GROWTH-", ""),
-            values.get("-PESSIMISTIC_WACC-", ""),
-            values.get("-PESSIMISTIC_TERMINAL-", ""),
-            values.get("-MIDDLE_GROWTH-", ""),
-            values.get("-MIDDLE_WACC-", ""),
-            values.get("-MIDDLE_TERMINAL-", ""),
-            values.get("-OPTIMISTIC_GROWTH-", ""),
-            values.get("-OPTIMISTIC_WACC-", ""),
-            values.get("-OPTIMISTIC_TERMINAL-", ""),
-            values.get("-NOTES-", "").strip(),
-        ]
-        worksheet.add_rows(1)  # Expand grid before writing to avoid exceeding row limits
-        worksheet.update(values=[row], range_name=f"A{next_row}")
+        with open(_analysis_path(analysis_name), "w", encoding="utf-8") as fh:
+            json.dump(row, fh, indent=2)
         sg.popup("Analysis saved successfully!")
     except Exception as e:
-        sg.popup_error(f"Error saving: {e}")
+        sg.popup_error(f"Error saving analysis: {e}")
 
 
 def delete_analysis(analysis_name):
-    worksheet = get_worksheet()
-    if not worksheet:
-        return False
-    try:
-        cell = worksheet.find(analysis_name)
-        if cell:
-            worksheet.delete_rows(cell.row)
+    """Delete the JSON file for a given analysis name."""
+    path = _analysis_path(analysis_name)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
             return True
-        sg.popup_error(f"Analysis '{analysis_name}' not found.")
-        return False
-    except Exception as e:
-        sg.popup_error(f"Error deleting analysis: {e}")
-        return False
-
+        except Exception as e:
+            sg.popup_error(f"Error deleting analysis: {e}")
+            return False
+    sg.popup_error(f"Analysis '{analysis_name}' not found.")
+    return False
 
 
 def refresh_sensitivity_table(window, params, values):
@@ -268,7 +245,7 @@ left_col = [
     [sg.Text("Cash Equivalents (millions):",    size=(28, 1)), sg.InputText("10820",  key="-CASH-",    size=(14, 1))],
     [sg.Text("Shares Outstanding (millions):",  size=(28, 1)), sg.InputText("989.24", key="-SHARES-",  size=(14, 1))],
     [sg.Text("Years to Project:",               size=(28, 1)), sg.InputText("5",      key="-YEARS-",   size=(14, 1))],
-    [sg.Text("Current Market Price:",       size=(28, 1)), sg.InputText("",       key="-MARKET_PRICE-", size=(14, 1))],
+    [sg.Text("Current Market Price:",           size=(28, 1)), sg.InputText("",       key="-MARKET_PRICE-", size=(14, 1))],
     [sg.HorizontalSeparator()],
 
     # Scenarios
@@ -281,7 +258,7 @@ left_col = [
 
     # Buttons
     [
-        sg.Button("Calculate"),
+        sg.Button("Calculate", button_color=("white", "#27AE60")),
         sg.Button("Save Analysis"),
     ],
 ]
@@ -340,7 +317,8 @@ right_col = [
     [sg.Listbox(values=[], key="-ANALYSIS_LIST-", size=(70, 10), enable_events=True)],
     [
         sg.Button("Load Selected",   disabled=True, key="-LOAD_SELECTED-"),
-        sg.Button("Delete Selected", disabled=True, key="-DELETE_SELECTED-"),
+        sg.Button("Delete Selected", button_color=("white", "#C0392B"), disabled=True, key="-DELETE_SELECTED-"),
+        sg.Button("Open File",       disabled=True, key="-OPEN_FILE-"),
         sg.Button("Reload Database"),
     ],
 ]
@@ -360,6 +338,7 @@ window["-ANALYSIS_LIST-"].update(values=analysis_names)
 has_items = bool(analysis_names)
 window["-LOAD_SELECTED-"].update(disabled=not has_items)
 window["-DELETE_SELECTED-"].update(disabled=not has_items)
+window["-OPEN_FILE-"].update(disabled=not has_items)
 
 # Cache last calculated results for sensitivity table
 last_params = {}
@@ -447,7 +426,7 @@ while True:
         if not name:
             sg.popup_error("Please enter an analysis name.")
         else:
-            exists = any(a.get("analysis_name") == name for a in loaded_database)
+            exists = os.path.exists(_analysis_path(name))
             if exists:
                 new_name = sg.popup_get_text(
                     f"'{name}' already exists. Enter a new name:", title="Rename")
@@ -468,12 +447,14 @@ while True:
         has_items = bool(analysis_names)
         window["-LOAD_SELECTED-"].update(disabled=not has_items)
         window["-DELETE_SELECTED-"].update(disabled=not has_items)
+        window["-OPEN_FILE-"].update(disabled=not has_items)
 
     # ── List selection ─────────────────────────────────────────────────────────
     elif event == "-ANALYSIS_LIST-":
         selected = bool(values["-ANALYSIS_LIST-"])
         window["-LOAD_SELECTED-"].update(disabled=not selected)
         window["-DELETE_SELECTED-"].update(disabled=not selected)
+        window["-OPEN_FILE-"].update(disabled=not selected)
 
     # ── Load selected ──────────────────────────────────────────────────────────
     elif event == "-LOAD_SELECTED-":
@@ -518,6 +499,25 @@ while True:
                     has_items = bool(analysis_names)
                     window["-LOAD_SELECTED-"].update(disabled=not has_items)
                     window["-DELETE_SELECTED-"].update(disabled=not has_items)
+                    window["-OPEN_FILE-"].update(disabled=not has_items)
                     sg.popup(f"'{sel_name}' deleted.")
+
+    # ── Open File ──────────────────────────────────────────────────────────────
+    elif event == "-OPEN_FILE-":
+        if values["-ANALYSIS_LIST-"]:
+            sel_name = values["-ANALYSIS_LIST-"][0]
+            path = _analysis_path(sel_name)
+            if os.path.exists(path):
+                try:
+                    if sys.platform == "win32":
+                        os.startfile(path)
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", path])
+                    else:
+                        subprocess.Popen(["xdg-open", path])
+                except Exception as e:
+                    sg.popup_error(f"Could not open file: {e}")
+            else:
+                sg.popup_error(f"File not found: {path}")
 
 window.close()
