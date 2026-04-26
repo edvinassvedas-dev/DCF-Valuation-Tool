@@ -254,7 +254,7 @@ left_col = [
 
     # Notes
     [sg.Text("Notes", font=("Helvetica", 11, "bold"))],
-    [sg.Multiline(key="-NOTES-", size=(55, 10), no_scrollbar=False)],
+    [sg.Multiline(key="-NOTES-", size=(55, 12), no_scrollbar=False)],
 
     # Buttons
     [
@@ -318,8 +318,11 @@ right_col = [
     [
         sg.Button("Load Selected",   disabled=True, key="-LOAD_SELECTED-"),
         sg.Button("Delete Selected", button_color=("white", "#C0392B"), disabled=True, key="-DELETE_SELECTED-"),
-        sg.Button("Open File",       disabled=True, key="-OPEN_FILE-"),
         sg.Button("Reload Database"),
+    ],
+    [
+        sg.Button("Open File",       disabled=True, key="-OPEN_FILE-"),
+        sg.Button("Open Folder",     key="-OPEN_DIR-"),
     ],
 ]
 
@@ -331,7 +334,7 @@ layout = [
     ]
 ]
 
-window = sg.Window("DCF Calculation", layout, size=(980, 600), resizable=True, finalize=True)
+window = sg.Window("DCF Calculation", layout, size=(980, 620), resizable=True, finalize=True)
 
 loaded_database, analysis_names = load_database()
 window["-ANALYSIS_LIST-"].update(values=analysis_names)
@@ -519,5 +522,16 @@ while True:
                     sg.popup_error(f"Could not open file: {e}")
             else:
                 sg.popup_error(f"File not found: {path}")
+    # ── Open Folder ────────────────────────────────────────────────────────────
+    elif event == "-OPEN_DIR-":
+        try:
+            if sys.platform == "win32":
+                os.startfile(DB_DIR)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", DB_DIR])
+            else:
+                subprocess.Popen(["xdg-open", DB_DIR])
+        except Exception as e:
+            sg.popup_error(f"Could not open folder: {e}")
 
 window.close()
